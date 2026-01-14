@@ -22,7 +22,7 @@ fi
 
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误: 必须使用 root 用户运行此脚本${PLAIN}" && exit 1
 
-# 2. 状态检查
+# 状态检查
 check_status() {
     if [[ "$OS" == "alpine" ]]; then
         if [ ! -f "/etc/init.d/hysteria" ]; then return 2; fi
@@ -39,36 +39,64 @@ check_status() {
 install_deps() {
     echo -e "${YELLOW}正在安装基础依赖...${PLAIN}"
     case "$OS" in
-        alpine) apk update && apk add --no-cache curl openssl ca-certificates file bash wget ;;
-        debian|ubuntu) apt update && apt install -y curl openssl ca-certificates wget ;;
-        *) yum install -y curl openssl ca-certificates wget || dnf install -y curl openssl ca-certificates wget ;;
+        alpine) apk update && apk add --no-cache curl openssl ca-certificates file bash wget socat ;;
+        debian|ubuntu) apt update && apt install -y curl openssl ca-certificates wget socat ;;
+        *) yum install -y curl openssl ca-certificates wget socat || dnf install -y curl openssl ca-certificates wget socat ;;
     esac
 }
 
-enable_bbr() {
-    echo -e "${YELLOW}正在开启内核 BBR 加速...${PLAIN}"
-    sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-    sysctl -p
-    echo -e "${GREEN}BBR 开启成功！${PLAIN}"
-    read -p "按回车返回..."
+# 2. 自动申请证书逻辑
+get_cert() {
+    local domain=$1
+    mkdir -p /etc/hysteria
+    
+    echo -e "${YELLOW}正在安装 acme.sh 并申请正式证书...${PLAIN}"
+    curl https://get.acme.sh | sh -s email=my@example.com
+    alias acme.sh='/root/.acme.sh/acme.sh'
+    
+    # 释放 80 端口
+    if [[ "$OS" == "alpine" ]]; then
+        rc-service nginx stop 2>/dev/null
+        rc-service apache2 stop 2>/dev/null
+    else
+        systemctl stop nginx 2>/dev/null
+        systemctl stop apache2 2>/dev/null
+    fi
+    
+    # 申请证书 (使用 Let's Encrypt 提高兼容性)
+    /root/.acme.sh/acme.sh --upgrade --auto-upgrade
+    /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+    /root/.acme.sh/acme.sh --issue -d "$domain" --standalone --keylength ec-256
+    
+    if [ $? -eq 0 ]; then
+        /root/.acme.sh/acme.sh --install-cert -d "$domain" --ecc \
+            --key-file /etc/hysteria/server.key \
+            --fullchain-file /etc/hysteria/server.crt
+        echo -e "${GREEN}正式证书申请并安装成功！${PLAIN}"
+        CERT_TYPE="Official"
+    else
+        echo -e "${RED}证书申请失败！可能原因: 1. 80端口被占用 2. 域名解析未生效。${PLAIN}"
+        echo -e "${YELLOW}正在生成临时自签证书以保证服务启动...${PLAIN}"
+        openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
+            -keyout /etc/hysteria/server.key -out /etc/hysteria/server.crt \
+            -subj "/CN=$domain" -days 3650
+        CERT_TYPE="Self-Signed"
+    fi
 }
 
-# 3. 安装/重组 Hysteria 2
+# 3. 安装主函数
 install_hy2() {
     install_deps
     
-    echo -e "\n${CYAN}--- 基础配置 ---${PLAIN}"
-    read -p "请输入你的域名 (例如 de.yourdomain.com): " DOMAIN
-    [ -z "${DOMAIN}" ] && echo -e "${RED}必须输入域名！${PLAIN}" && return
+    echo -e "\n${CYAN}--- Hysteria 2 部署 ---${PLAIN}"
+    read -p "请输入你的域名: " DOMAIN
+    if [ -z "$DOMAIN" ]; then echo -e "${RED}域名不能为空！${PLAIN}" && return; fi
     
-    read -p "请输入服务监听端口 [默认 443]: " PORT
-    [ -z "${PORT}" ] && PORT="443"
-
+    read -p "请输入监听端口 [默认 443]: " PORT
+    [ -z "$PORT" ] && PORT="443"
+    
     read -p "请输入伪装域名 [默认 https://www.bing.com]: " MASK_URL
-    [ -z "${MASK_URL}" ] && MASK_URL="https://www.bing.com"
+    [ -z "$MASK_URL" ] && MASK_URL="https://www.bing.com"
 
     # 安装二进制
     if [[ "$OS" == "alpine" ]]; then
@@ -80,54 +108,37 @@ install_hy2() {
         bash <(curl -fsSL https://get.hy2.sh/)
     fi
 
-    # 证书处理逻辑
-    mkdir -p /etc/hysteria
-    echo -e "\n${YELLOW}请确保你已经将域名证书放置在以下位置:${PLAIN}"
-    echo -e "证书 (CRT): ${CYAN}/etc/hysteria/server.crt${PLAIN}"
-    echo -e "私钥 (KEY): ${CYAN}/etc/hysteria/server.key${PLAIN}"
-    
-    if [ ! -f "/etc/hysteria/server.crt" ]; then
-        echo -e "${RED}警告: 未发现证书文件，将先生成临时自签证书，请后续手动替换以启用域名模式！${PLAIN}"
-        openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
-            -keyout /etc/hysteria/server.key -out /etc/hysteria/server.crt \
-            -subj "/CN=$DOMAIN" -days 365
-    fi
+    # 核心步骤：申请证书
+    get_cert "$DOMAIN"
 
     PASSWORD=$(openssl rand -base64 12 | tr -d '/+=')
     
-    # 写入配置 (移除带宽限制，增加伪装)
+    # 写入配置
     cat <<EOF > $CONF_FILE
 listen: :$PORT
-
 tls:
   cert: /etc/hysteria/server.crt
   key: /etc/hysteria/server.key
-
 auth:
   type: password
   password: "$PASSWORD"
-
 masquerade:
   type: proxy
   proxy:
     url: $MASK_URL
     rewriteHost: true
-
 quic:
   maxIdleTimeout: 30s
 EOF
 
-    # 权限修复 (关键)
+    # 权限与服务启动
     if [[ "$OS" != "alpine" ]]; then
-        # 兼容旧版本可能存在的 User=hysteria
         sed -i 's/User=hysteria/User=root/g' /etc/systemd/system/hysteria-server.service 2>/dev/null
         chown -R root:root /etc/hysteria
-        chmod 600 /etc/hysteria/server.key
         systemctl daemon-reload
         systemctl enable hysteria-server
         systemctl restart hysteria-server
     else
-        # Alpine OpenRC
         cat <<EOF > /etc/init.d/hysteria
 #!/sbin/openrc-run
 name="Hysteria2"
@@ -142,57 +153,58 @@ EOF
         rc-service hysteria restart
     fi
 
-    # 创建快捷命令
     ln -sf "$(realpath "$0")" /usr/bin/hy2 2>/dev/null
-    echo -e "${GREEN}Hysteria 2 域名版部署完成！${PLAIN}"
-    show_link "$DOMAIN"
+    echo -e "${GREEN}安装完成！${PLAIN}"
+    show_link "$DOMAIN" "$CERT_TYPE"
 }
 
-# 4. 显示配置 (去掉 insecure, 增加 SNI)
+# 4. 信息显示
 show_link() {
-    DOMAIN=${1:-"你的域名"}
+    DOMAIN=$1
+    C_TYPE=$2
     PW=$(grep 'password:' $CONF_FILE | awk '{print $2}' | tr -d '"')
     PT=$(grep 'listen:' $CONF_FILE | awk -F: '{print $NF}')
     
-    # 生成客户端链接
-    URL="hysteria2://${PW}@${DOMAIN}:${PT}/?sni=${DOMAIN}#Hy2_${DOMAIN}"
+    INSECURE="0"
+    [ "$C_TYPE" == "Self-Signed" ] && INSECURE="1"
+
+    URL="hysteria2://${PW}@${DOMAIN}:${PT}/?sni=${DOMAIN}&insecure=${INSECURE}#Hy2_${DOMAIN}"
     
-    echo -e "\n${BLUE}========== 客户端配置信息 ==========${PLAIN}"
-    echo -e "服务器地址: ${GREEN}${DOMAIN}${PLAIN}"
-    echo -e "监听端口:   ${GREEN}${PT}${PLAIN}"
-    echo -e "验证密码:   ${GREEN}${PW}${PLAIN}"
-    echo -e "SNI:        ${GREEN}${DOMAIN}${PLAIN}"
-    echo -e "允许不安全: ${RED}OFF (已禁用, 请使用正式证书)${PLAIN}"
-    echo -e "\n${YELLOW}通用节点链接:${PLAIN}"
+    echo -e "\n${BLUE}========== 节点信息 ==========${PLAIN}"
+    echo -e "域名:     ${GREEN}${DOMAIN}${PLAIN}"
+    echo -e "端口:     ${GREEN}${PT}${PLAIN}"
+    echo -e "密码:     ${GREEN}${PW}${PLAIN}"
+    echo -e "证书类型: ${CYAN}${C_TYPE}${PLAIN}"
+    echo -e "SNI:      ${GREEN}${DOMAIN}${PLAIN}"
+    echo -e "\n${YELLOW}通用配置链接:${PLAIN}"
     echo -e "${CYAN}${URL}${PLAIN}"
-    echo -e "${BLUE}====================================${PLAIN}"
+    echo -e "${BLUE}==============================${PLAIN}"
+    [ "$C_TYPE" == "Self-Signed" ] && echo -e "${RED}注意：当前使用的是自签证书，请确保客户端开启 '允许不安全'。${PLAIN}"
     read -p "按回车返回..."
 }
 
+# 菜单略 (与之前一致，仅修改 install_hy2 调用)
 show_menu() {
     clear
     check_status
     S_RES=$?
     echo -e "${PURPLE}==============================================${PLAIN}"
-    echo -e "${CYAN}    Hysteria 2 域名版管理脚本 (正式版)    ${PLAIN}"
-    echo -e "${BLUE} 系统: ${GREEN}$OS${PLAIN}  端口: ${GREEN}UDP 443 优先${PLAIN}"
+    echo -e "${CYAN}    Hysteria 2 全自动证书版 (V6.0)    ${PLAIN}"
     if [ $S_RES -eq 0 ]; then echo -e " 状态: ${GREEN}运行中${PLAIN}"
     elif [ $S_RES -eq 1 ]; then echo -e " 状态: ${RED}已停止${PLAIN}"
     else echo -e " 状态: ${YELLOW}未安装${PLAIN}"; fi
     echo -e "${PURPLE}----------------------------------------------${PLAIN}"
-    echo -e " 1. 安装/重构 Hysteria 2 (正式证书)"
-    echo -e " 2. 查看节点链接信息"
+    echo -e " 1. 安装/重构 Hysteria 2"
+    echo -e " 2. 查看配置信息"
     echo -e " 3. 启动服务      4. 停止服务"
-    echo -e " 5. 重启服务      6. 开启内核 BBR 加速"
+    echo -e " 5. 重启服务      6. 开启 BBR"
     echo -e " 7. 卸载服务      0. 退出"
     echo -e "${PURPLE}----------------------------------------------${PLAIN}"
-    read -p "选择 [0-7]: " num
+    read -p "选择: " num
     case "$num" in
         1) install_hy2 ;;
-        2) show_link ;;
-        3) [[ "$OS" == "alpine" ]] && rc-service hysteria start || systemctl start hysteria-server ;;
-        4) [[ "$OS" == "alpine" ]] && rc-service hysteria stop || systemctl stop hysteria-server ;;
-        5) [[ "$OS" == "alpine" ]] && rc-service hysteria restart || systemctl restart hysteria-server ;;
+        2) show_link "$(grep 'cert:' $CONF_FILE -A 2 | grep -v 'cert' | head -n 1 | awk '{print $NF}' | xargs dirname | xargs basename | cut -d'_' -f1)" "Unknown" ;;
+        3|4|5) [[ "$OS" == "alpine" ]] && rc-service hysteria ${num/3/start}; [[ "$OS" == "alpine" ]] && rc-service hysteria ${num/4/stop}; [[ "$OS" == "alpine" ]] && rc-service hysteria ${num/5/restart} || systemctl ${num/3/start}${num/4/stop}${num/5/restart} hysteria-server ;;
         6) enable_bbr ;;
         7) 
             [[ "$OS" == "alpine" ]] && (rc-service hysteria stop; rc-update del hysteria default; rm -rf /etc/init.d/hysteria) || (systemctl stop hysteria-server; systemctl disable hysteria-server)
@@ -202,5 +214,4 @@ show_menu() {
         *) show_menu ;;
     esac
 }
-
 show_menu
