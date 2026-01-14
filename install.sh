@@ -11,7 +11,6 @@ PLAIN='\033[0m'
 
 CONF_FILE="/etc/hysteria/config.yaml"
 BIN_FILE="/usr/local/bin/hysteria"
-# 强制定义脚本位置，解决 bash <(curl) 的路径问题
 HY_SCRIPT="/usr/bin/hy"
 
 # 1. 环境检查
@@ -24,52 +23,40 @@ else
     echo -e "${RED}无法识别系统版本！${PLAIN}" && exit 1
 fi
 
-check_status() {
-    if [[ "$OS" == "alpine" ]]; then
-        if [ ! -f "/etc/init.d/hysteria" ]; then return 2; fi
-        rc-service hysteria status | grep -q "started" && return 0 || return 1
-    else
-        if ! systemctl is-active --quiet hysteria-server.service; then
-            if [ ! -f "/etc/systemd/system/hysteria-server.service" ]; then return 2; fi
-            return 1
-        fi
-        return 0
-    fi
-}
-
-# 2. 自动申请正式证书 (增加 --force 强制覆盖)
+# 2. 强制领证函数
 get_cert() {
     local domain=$1
     mkdir -p /etc/hysteria
     
-    echo -e "${YELLOW}正在通过 ACME 申请正式证书 (强制模式)...${PLAIN}"
-    # 安装依赖
+    echo -e "${YELLOW}正在通过 ACME 申请正式证书 (强制清理模式)...${PLAIN}"
+    
     case "$OS" in
         alpine) apk add --no-cache socat ;;
         *) apt install -y socat || yum install -y socat ;;
     esac
 
-    # 安装 acme.sh
     curl https://get.acme.sh | sh -s email=cert@${domain}
     alias acme.sh='/root/.acme.sh/acme.sh'
     
-    # 强制释放 80 端口
-    fuser -k 80/tcp 2>/dev/null
+    # 彻底清理旧记忆，防止 Skipping
+    rm -rf /root/.acme.sh/${domain}_ecc
+    rm -rf /root/.acme.sh/${domain}
     
-    # 强制申请并安装证书
+    # 暴力释放 80 端口
+    [ -f /usr/bin/fuser ] && fuser -k 80/tcp 2>/dev/null
+    
     /root/.acme.sh/acme.sh --upgrade --auto-upgrade
     /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-    # 增加 --force 确保跳过缓存直接重新领证
     /root/.acme.sh/acme.sh --issue -d "$domain" --standalone --keylength ec-256 --force
     
     if [ $? -eq 0 ]; then
         /root/.acme.sh/acme.sh --install-cert -d "$domain" --ecc \
             --key-file /etc/hysteria/server.key \
             --fullchain-file /etc/hysteria/server.crt
-        echo -e "${GREEN}正式证书申请并安装成功！${PLAIN}"
+        echo -e "${GREEN}正式证书申请成功！${PLAIN}"
         CERT_STAT="Official"
     else
-        echo -e "${RED}正式证书申请失败，将使用自签证书备选。${PLAIN}"
+        echo -e "${RED}正式证书申请失败，将回退至自签模式。${PLAIN}"
         openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
             -keyout /etc/hysteria/server.key -out /etc/hysteria/server.crt \
             -subj "/CN=$domain" -days 3650
@@ -84,9 +71,9 @@ install_hy2() {
         *) apt update && apt install -y curl openssl ca-certificates wget ;;
     esac
     
-    echo -e "\n${CYAN}--- Hysteria 2 自动化配置 (V8.0) ---${PLAIN}"
+    echo -e "\n${CYAN}--- Hysteria 2 自动化配置 (V3.0) ---${PLAIN}"
     read -p "请输入你的域名: " DOMAIN
-    [[ -z "$DOMAIN" ]] && echo -e "${RED}必须输入域名！${PLAIN}" && return
+    [[ -z "$DOMAIN" ]] && echo -e "${RED}域名不能为空！${PLAIN}" && return
     
     read -p "请输入端口 [默认 443]: " PORT
     [[ -z "$PORT" ]] && PORT="443"
@@ -94,8 +81,8 @@ install_hy2() {
     # 安装内核
     if [[ "$OS" == "alpine" ]]; then
         ARCH=$(uname -m)
-        [ "$ARCH" = "x86_64" ] && BINARY="hysteria-linux-amd64" || BINARY="hysteria-linux-arm64"
-        curl -L -o $BIN_FILE "https://github.com/apernet/hysteria/releases/latest/download/${BINARY}"
+        [ "$ARCH" = "x86_64" ] && BIN="hysteria-linux-amd64" || BIN="hysteria-linux-arm64"
+        curl -L -o $BIN_FILE "https://github.com/apernet/hysteria/releases/latest/download/${BIN}"
         chmod +x $BIN_FILE
     else
         bash <(curl -fsSL https://get.hy2.sh/)
@@ -105,6 +92,7 @@ install_hy2() {
 
     PASSWORD=$(openssl rand -base64 12 | tr -d '/+=')
     
+    # 写入配置
     cat <<EOF > $CONF_FILE
 listen: :$PORT
 tls:
@@ -122,70 +110,78 @@ quic:
   maxIdleTimeout: 30s
 EOF
 
-    # 权限与自启
+    # 启动服务
     if [[ "$OS" != "alpine" ]]; then
         sed -i 's/User=hysteria/User=root/g' /etc/systemd/system/hysteria-server.service 2>/dev/null
-        chown -R root:root /etc/hysteria
         systemctl daemon-reload && systemctl enable hysteria-server && systemctl restart hysteria-server
     else
-        # Alpine OpenRC 配置略... (保持之前的即可)
-        rc-service hysteria restart
+        # Alpine OpenRC
+        cat <<EOF > /etc/init.d/hysteria
+#!/sbin/openrc-run
+name="Hysteria2"
+command="$BIN_FILE"
+command_args="server -c $CONF_FILE"
+command_background="yes"
+pidfile="/run/hysteria.pid"
+depend() { need net; }
+EOF
+        chmod +x /etc/init.d/hysteria
+        rc-update add hysteria default && rc-service hysteria restart
     fi
 
-    # 关键修复：直接从 GitHub 下载自己到 /usr/bin/hy，解决悬空软链接问题
+    # 快捷键安装：从 GitHub 重新同步自身
     curl -fsSL https://raw.githubusercontent.com/LoganLazy/HY2-2.0/refs/heads/main/install.sh -o $HY_SCRIPT
     chmod +x $HY_SCRIPT
     
-    echo -e "${GREEN}安装成功！以后输入 hy 即可管理服务。${PLAIN}"
+    echo -e "${GREEN}部署成功！以后输入 hy 即可管理。${PLAIN}"
     show_link
 }
 
-# 4. 信息查看
+# 4. 节点信息 (精准提取域名)
 show_link() {
-    if [ ! -f "/etc/hysteria/server.crt" ]; then echo -e "${RED}证书不存在！${PLAIN}" && return; fi
+    [ ! -f "/etc/hysteria/server.crt" ] && echo -e "${RED}未发现证书！${PLAIN}" && return
     
-    CN=$(openssl x509 -in /etc/hysteria/server.crt -noout -subject | sed 's/.*CN = //')
+    # 修复：兼容多种格式的域名提取逻辑
+    CN=$(openssl x509 -in /etc/hysteria/server.crt -noout -subject | sed 's/^.*CN = //; s/^.*CN=//')
     ISSUER=$(openssl x509 -in /etc/hysteria/server.crt -noout -issuer)
     
-    [[ "$ISSUER" == *"Let's Encrypt"* ]] && C_TYPE="Official" || C_TYPE="Self-Signed"
-    [[ "$C_TYPE" == "Official" ]] && INSECURE="0" || INSECURE="1"
+    [[ "$ISSUER" == *"Let's Encrypt"* ]] && TYPE="Official" || TYPE="Self-Signed"
+    [[ "$TYPE" == "Official" ]] && INS="0" || INS="1"
 
     PW=$(grep 'password:' $CONF_FILE | awk '{print $2}' | tr -d '"')
     PT=$(grep 'listen:' $CONF_FILE | awk -F: '{print $NF}' | tr -d ' ')
-    URL="hysteria2://${PW}@${CN}:${PT}/?sni=${CN}&insecure=${INSECURE}#Hy2_${CN}"
+    URL="hysteria2://${PW}@${CN}:${PT}/?sni=${CN}&insecure=${INS}#Hy2_${CN}"
     
-    echo -e "\n${BLUE}========== 节点信息 ==========${PLAIN}"
+    echo -e "\n${BLUE}========== 节点配置信息 ==========${PLAIN}"
     echo -e "域名 (CN):  ${GREEN}${CN}${PLAIN}"
-    echo -e "证书状态:   ${CYAN}${C_TYPE}${PLAIN}"
-    echo -e "配置链接:   ${YELLOW}${URL}${PLAIN}"
-    echo -e "${BLUE}==============================${PLAIN}"
+    echo -e "证书状态:   ${CYAN}${TYPE}${PLAIN}"
+    echo -e "验证密码:   ${GREEN}${PW}${PLAIN}"
+    echo -e "监听端口:   ${GREEN}${PT}${PLAIN}"
+    echo -e "\n${YELLOW}通用配置链接:${PLAIN}"
+    echo -e "${CYAN}${URL}${PLAIN}"
+    echo -e "${BLUE}==================================${PLAIN}"
     read -p "按回车返回..."
 }
 
-# 5. 菜单
+# 5. 简单菜单
 show_menu() {
     clear
-    check_status
-    S_RES=$?
     echo -e "${PURPLE}==============================================${PLAIN}"
-    echo -e "${CYAN}    Hysteria 2 全自动证书版 (V3.0)    ${PLAIN}"
-    if [ $S_RES -eq 0 ]; then echo -e " 状态: ${GREEN}运行中${PLAIN}"
-    elif [ $S_RES -eq 1 ]; then echo -e " 状态: ${RED}已停止${PLAIN}"
-    else echo -e " 状态: ${YELLOW}未安装${PLAIN}"; fi
+    echo -e "${CYAN}    Hysteria 2 终极全自动版 (V3.0)    ${PLAIN}"
     echo -e "${PURPLE}----------------------------------------------${PLAIN}"
     echo -e " 1. 安装/重构 Hysteria 2"
     echo -e " 2. 查看配置信息"
     echo -e " 3. 启动服务      4. 停止服务"
-    echo -e " 5. 重启服务      6. 开启内核 BBR 加速"
+    echo -e " 5. 重启服务      6. 开启内核 BBR"
     echo -e " 7. 卸载服务      0. 退出"
     echo -e "${PURPLE}----------------------------------------------${PLAIN}"
-    read -p "选择 [0-7]: " num
+    read -p "选择: " num
     case "$num" in
         1) install_hy2 ;;
         2) show_link ;;
-        3|4|5) systemctl ${num/3/start}${num/4/stop}${num/5/restart} hysteria-server ;;
-        6) echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf && echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf && sysctl -p ;;
-        7) systemctl stop hysteria-server; systemctl disable hysteria-server; rm -f $CONF_FILE $HY_SCRIPT ;;
+        3|4|5) [[ "$OS" == "alpine" ]] && rc-service hysteria ${num/3/start}${num/4/stop}${num/5/restart} || systemctl ${num/3/start}${num/4/stop}${num/5/restart} hysteria-server ;;
+        6) echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf; echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf; sysctl -p ;;
+        7) [[ "$OS" == "alpine" ]] && (rc-service hysteria stop; rc-update del hysteria default) || (systemctl stop hysteria-server; systemctl disable hysteria-server); rm -f $CONF_FILE $HY_SCRIPT ;;
         0) exit 0 ;;
         *) show_menu ;;
     esac
